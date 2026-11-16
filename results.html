@@ -458,6 +458,8 @@ function compute(code, s, src) {
    Worked out here on the page from the weights, nothing extra is saved. */
 const Z_CUT = 3.5, Z_MIN = 8, Z_DAYS = 60;
 const OUT = [{ k: 'MC', v: r => r.mc }, { k: 'VM', v: r => r.vmDb }, { k: 'ASH', v: r => r.ashDb }];
+// a supplier's "· Retest N" samples count with the original supplier (Girish, 16 Nov)
+const zGroup = sup => String(sup || '').replace(/(\s*·\s*Retest\s*\d*)+\s*$/i, '').trim();
 const zTxt = z => (z >= 0 ? '+' : '−') + Math.abs(z).toFixed(1);
 // largest |Z| of a result (for the Z column and sorting)
 const zTop = r => Object.entries(r.z || {}).reduce((b, [k, o]) => !b || Math.abs(o.z) > Math.abs(b.z) ? { k, ...o } : b, null);
@@ -465,7 +467,7 @@ function markOutliers(rows) {
   const med = a => { const s = a.slice().sort((x, y) => x - y), m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
   OUT.forEach(o => {
     const bySup = {};
-    rows.forEach(r => { if (r.supplier && isNum(o.v(r))) (bySup[r.supplier] = bySup[r.supplier] || []).push(r); });
+    rows.forEach(r => { const g = zGroup(r.supplier); if (g && isNum(o.v(r))) (bySup[g] = bySup[g] || []).push(r); });
     Object.values(bySup).forEach(g => g.forEach(r => {
       const t = r.last;
       const vals = g.filter(x => x !== r && (t == null || x.last == null || Math.abs(x.last - t) <= Z_DAYS * 864e5)).map(o.v);
@@ -474,7 +476,7 @@ function markOutliers(rows) {
       const v = o.v(r), z = 0.6745 * (v - m) / mad;
       r.z[o.k] = { z, m, n: vals.length };
       if (Math.abs(z) > Z_CUT && !r.flagTests.has(o.k)) {  // out of limit is already flagged
-        r.checks.push(`${TNAME[o.k]} ${v.toFixed(2)} %${o.k === 'MC' ? '' : ' db'} unusual for ${r.supplier} (Z ${zTxt(z)}, usual ${m.toFixed(1)} %)`);
+        r.checks.push(`${TNAME[o.k]} ${v.toFixed(2)} %${o.k === 'MC' ? '' : ' db'} unusual for ${zGroup(r.supplier)} (Z ${zTxt(z)}, usual ${m.toFixed(1)} %)`);
         r.suspect.add(o.k);
       }
     }));
@@ -1061,7 +1063,7 @@ function zCell(r) {
   const t = zTop(r);
   if (!t) return `<td class="num" title="Fewer than ${Z_MIN} results for this supplier within ${Z_DAYS} days: only the fixed limits check it"><span class="sm">–</span></td>`;
   const big = Math.abs(t.z) > Z_CUT, tip = OUT.filter(o => r.z[o.k]).map(o => `${TNAME[o.k]} ${zTxt(r.z[o.k].z)} (usual ${r.z[o.k].m.toFixed(1)} %)`).join(' · ')
-    + ` · vs ${t.n} ${r.supplier} results · above ${Z_CUT} = unusual`;
+    + ` · vs ${t.n} ${zGroup(r.supplier)} results · above ${Z_CUT} = unusual`;
   return `<td class="num${big ? ' sus' : ''}" title="${esc(tip)}">${big ? '? ' : ''}${zTxt(t.z)} <span class="sm">${TNAME[t.k]}</span></td>`;
 }
 function tableHTML(list, anyTm) {
@@ -1103,7 +1105,7 @@ function detail(id) {
       ${res('Fixed carbon (db)', r.fcDb, false, 'ar ' + f2(r.fcAr))}
       ${r.hasTm ? res('Total moisture', r.tm, isHi(r, 'TM')) : ''}
     </div>
-    ${[r.mc, r.vmDb, r.ashDb].some(isNum) ? `<p class="sub" style="margin:0 0 8px">${Object.keys(r.z).length ? `Z score vs ${esc(r.supplier)} (results within ${Z_DAYS} days): ${OUT.filter(o => r.z[o.k]).map(o => `<b${Math.abs(r.z[o.k].z) > Z_CUT ? ' style="color:var(--warn)"' : ''}>${TNAME[o.k]} ${zTxt(r.z[o.k].z)}</b> (usual ${r.z[o.k].m.toFixed(1)} %, ${r.z[o.k].n} results)`).join(' · ')}. Above ${Z_CUT} either way = unusual, a possible error.`
+    ${[r.mc, r.vmDb, r.ashDb].some(isNum) ? `<p class="sub" style="margin:0 0 8px">${Object.keys(r.z).length ? `Z score vs ${esc(zGroup(r.supplier))}${zGroup(r.supplier) !== r.supplier ? ' incl. retests' : ''} (results within ${Z_DAYS} days): ${OUT.filter(o => r.z[o.k]).map(o => `<b${Math.abs(r.z[o.k].z) > Z_CUT ? ' style="color:var(--warn)"' : ''}>${TNAME[o.k]} ${zTxt(r.z[o.k].z)}</b> (usual ${r.z[o.k].m.toFixed(1)} %, ${r.z[o.k].n} results)`).join(' · ')}. Above ${Z_CUT} either way = unusual, a possible error.`
       : `No Z score: fewer than ${Z_MIN} results ${r.supplier ? 'for ' + esc(r.supplier) + ' ' : '(no supplier in the sheet) '}within ${Z_DAYS} days, so only the fixed limits check it.`}</p>` : ''}
     <div class="scroll"><table><thead><tr><th>Test</th><th>W1 empty (g)</th><th>W2 + sample (g)</th><th>W3 after heating (g)</th><th>Sample (g)</th><th>${'Loss / residue %'}</th></tr></thead>
       <tbody>${tests.map(k => { const w = r.w[k] || [], m = massOf(w), p = pctOf(k);
