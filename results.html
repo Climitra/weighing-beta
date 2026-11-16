@@ -449,28 +449,35 @@ function compute(code, s, src) {
     status, state, pending: Object.keys(done).filter(k => !done[k]),
     mc: r2(mc), tm: r2(tm), vml: r2(vml), vmAr: r2(vmAr), vmDb: r2(vmDb), ashAr: r2(ashAr), ashDb: r2(ashDb), fcAr: r2(fcAr), fcDb: r2(fcDb),
     flags, flagTests, checks, suspect, appr, stale, w, ts, first, last, doneAt, who, hasTm: !!s.tm, lastText: s.last || '',
-    ev: s.ev || [], photos: s.photos || [], holders: holdersOf(s), runs: runsOf(D, code) };
+    ev: s.ev || [], photos: s.photos || [], holders: holdersOf(s), runs: runsOf(D, code), z: {} };
 }
 
-/* A result far from the usual for its supplier (or for all samples when the supplier has few) is a possible error,
-   even inside the limits: robust z-score = 0.6745 (x - median) / MAD above 3.5, and at least MIN_GAP points away. */
-const OUT = [{ k: 'MC', v: r => r.mc, gap: 3 }, { k: 'VM', v: r => r.vmDb, gap: 3 }, { k: 'ASH', v: r => r.ashDb, gap: 2 }];
+/* Robust Z score: how far a result is from the usual for its supplier, Z = 0.6745 (x - median) / MAD.
+   Compared only with the same test, the same supplier, results done within Z_DAYS of it (either side), not counting itself.
+   Fewer than Z_MIN such results: no Z, the fixed limits alone judge it. |Z| above Z_CUT = possible error (retest or approve).
+   Worked out here on the page from the weights, nothing extra is saved. */
+const Z_CUT = 3.5, Z_MIN = 8, Z_DAYS = 60;
+const OUT = [{ k: 'MC', v: r => r.mc }, { k: 'VM', v: r => r.vmDb }, { k: 'ASH', v: r => r.ashDb }];
+const zTxt = z => (z >= 0 ? '+' : '−') + Math.abs(z).toFixed(1);
+// largest |Z| of a result (for the Z column and sorting)
+const zTop = r => Object.entries(r.z || {}).reduce((b, [k, o]) => !b || Math.abs(o.z) > Math.abs(b.z) ? { k, ...o } : b, null);
 function markOutliers(rows) {
   const med = a => { const s = a.slice().sort((x, y) => x - y), m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
   OUT.forEach(o => {
-    const all = rows.filter(r => isNum(o.v(r)));
-    all.forEach(r => {
-      if (r.flagTests.has(o.k)) return;  // already out of limit
-      const same = r.supplier ? all.filter(x => x.supplier === r.supplier) : [];
-      const pool = same.length >= 6 ? same : all.length >= 8 ? all : null;
-      if (!pool) return;
-      const vals = pool.map(o.v), m = med(vals), mad = med(vals.map(v => Math.abs(v - m))) || 0.5;
+    const bySup = {};
+    rows.forEach(r => { if (r.supplier && isNum(o.v(r))) (bySup[r.supplier] = bySup[r.supplier] || []).push(r); });
+    Object.values(bySup).forEach(g => g.forEach(r => {
+      const t = r.last;
+      const vals = g.filter(x => x !== r && (t == null || x.last == null || Math.abs(x.last - t) <= Z_DAYS * 864e5)).map(o.v);
+      if (vals.length < Z_MIN) return;
+      const m = med(vals), mad = Math.max(med(vals.map(v => Math.abs(v - m))), 0.05);  // floor: identical results would divide by 0
       const v = o.v(r), z = 0.6745 * (v - m) / mad;
-      if (Math.abs(z) > 3.5 && Math.abs(v - m) >= o.gap) {
-        r.checks.push(`${TNAME[o.k]} ${v.toFixed(2)} %${o.k === 'MC' ? '' : ' db'} unusual (usual ${m.toFixed(1)} %${pool === same ? ' for ' + r.supplier : ''})`);
+      r.z[o.k] = { z, m, n: vals.length };
+      if (Math.abs(z) > Z_CUT && !r.flagTests.has(o.k)) {  // out of limit is already flagged
+        r.checks.push(`${TNAME[o.k]} ${v.toFixed(2)} %${o.k === 'MC' ? '' : ' db'} unusual for ${r.supplier} (Z ${zTxt(z)}, usual ${m.toFixed(1)} %)`);
         r.suspect.add(o.k);
       }
-    });
+    }));
   });
   // Retest agreement for the flagged and doubtful tests (lib/retest.js)
   const ctx = {};
@@ -591,7 +598,7 @@ function filtered() {
 function sorted(list) {
   const col = COLS.find(c => c.k === V.sort), d = V.dir;
   const key = col ? col.val : { code: null, name: r => r.name, supplier: r => r.supplier, machine: r => r.machine,
-    state: r => ['flag', 'check', 'running', 'none', 'approved', 'checked', 'complete'].indexOf(r.state), done: r => r.last, tm: r => r.tm }[V.sort];
+    state: r => ['flag', 'check', 'running', 'none', 'approved', 'checked', 'complete'].indexOf(r.state), done: r => r.last, tm: r => r.tm, z: r => { const t = zTop(r); return t ? Math.abs(t.z) : null; } }[V.sort];
   return list.slice().sort((x, y) => {
     if (!key) return d * cmpCode(x.code, y.code);
     const a = key(x), b = key(y);
@@ -1028,7 +1035,7 @@ function chartsPageHTML(list, machines, suppliers) {
 
 // Filter and sort bar right above the table; it shares V with the bar at the top of the page
 const SORTS = () => [['done', 'Last weighed'], ['code', 'Code'], ['name', 'Sample'], ['supplier', 'Supplier'], ['machine', 'Machine'], ['state', 'Status'],
-  ...COLS.map(c => [c.k, c.label + ' %'])];
+  ...COLS.map(c => [c.k, c.label + ' %']), ['z', 'Z score (most unusual)']];
 const sortDir0 = k => ['code', 'name', 'supplier', 'machine', 'state'].includes(k) ? 1 : -1;
 const isFiltered = () => V.status !== 'all' || V.lim || V.machine || V.supplier || V.src || V.q.trim();
 function tbarHTML(machines, suppliers, anyTm) {
@@ -1049,18 +1056,27 @@ function tbarHTML(machines, suppliers, anyTm) {
   </div>`;
 }
 
+// Z column: the most unusual of Moisture / VM / Ash for this supplier; hover for all three
+function zCell(r) {
+  const t = zTop(r);
+  if (!t) return `<td class="num" title="Fewer than ${Z_MIN} results for this supplier within ${Z_DAYS} days: only the fixed limits check it"><span class="sm">–</span></td>`;
+  const big = Math.abs(t.z) > Z_CUT, tip = OUT.filter(o => r.z[o.k]).map(o => `${TNAME[o.k]} ${zTxt(r.z[o.k].z)} (usual ${r.z[o.k].m.toFixed(1)} %)`).join(' · ')
+    + ` · vs ${t.n} ${r.supplier} results · above ${Z_CUT} = unusual`;
+  return `<td class="num${big ? ' sus' : ''}" title="${esc(tip)}">${big ? '? ' : ''}${zTxt(t.z)} <span class="sm">${TNAME[t.k]}</span></td>`;
+}
 function tableHTML(list, anyTm) {
   const th = (k, l, num) => `<th data-sort="${k}"${num ? ' class="num"' : ''}${V.sort === k ? ` aria-sort="${V.dir > 0 ? 'ascending' : 'descending'}"` : ''} title="Sort by ${l}">${l}${V.sort === k ? (V.dir > 0 ? ' ▲' : ' ▼') : ' <span class="hint">⇅</span>'}</th>`;
   const cell = (r, c) => { const v = c.val(r), hi = c.k !== 'FC' && isHi(r, c.k), sus = !hi && r.suspect.has(c.k);
     return `<td class="num${hi ? ' hi' : sus ? ' sus' : ''}">${hi ? '⚠ ' : sus ? '? ' : ''}${f2(v)}</td>`; };
   return `<div class="scroll"><table class="list"><thead><tr>
       ${th('code', 'Code')}${th('name', 'Sample')}${th('supplier', 'Supplier')}${th('machine', 'Machine')}${th('state', 'Status')}
-      ${COLS.map(c => th(c.k, c.label + ' %', true)).join('')}${anyTm ? th('tm', 'Total moist. %', true) : ''}
+      ${COLS.map(c => th(c.k, c.label + ' %', true)).join('')}${anyTm ? th('tm', 'Total moist. %', true) : ''}${th('z', 'Z', true)}
       <th>Notes</th>${th('done', 'Last weighed')}</tr></thead>
     <tbody>${list.map(r => `<tr data-id="${esc(r.id)}">
       <td><b>${esc(r.code)}</b>${r.photos.some(p => !p.skipped) ? ' <span title="photo in the trail">📷</span>' : ''}${SD.old ? `<span class="sm"> ${r.src === 'old' ? 'old' : 'QR'}</span>` : ''}</td><td>${esc(r.name) || '<span class="sm">–</span>'}</td><td>${esc(r.supplier) || '<span class="sm">–</span>'}</td>
       <td>${esc(r.machine) || '<span class="sm">–</span>'}</td><td>${pill(r)}</td>
       ${COLS.map(c => cell(r, c)).join('')}${anyTm ? `<td class="num${isHi(r, 'TM') ? ' hi' : ''}">${r.hasTm ? f2(r.tm) : '<span class="sm">–</span>'}</td>` : ''}
+      ${zCell(r)}
       <td class="wrapcell"><span class="sm">${esc([...(r.pending.length && r.status !== 'not started' ? ['waiting: ' + r.pending.map(k => TNAME[k]).join(', ')] : []),
         ...r.flags, ...r.checks, ...(r.appr && (r.flags.length || r.checksOk) ? ['approved by ' + (r.appr.by || '?')] : [])].join(' · '))}</span></td>
       <td>${when(r.last)}</td></tr>`).join('')}</tbody></table></div>`;
@@ -1087,6 +1103,8 @@ function detail(id) {
       ${res('Fixed carbon (db)', r.fcDb, false, 'ar ' + f2(r.fcAr))}
       ${r.hasTm ? res('Total moisture', r.tm, isHi(r, 'TM')) : ''}
     </div>
+    ${[r.mc, r.vmDb, r.ashDb].some(isNum) ? `<p class="sub" style="margin:0 0 8px">${Object.keys(r.z).length ? `Z score vs ${esc(r.supplier)} (results within ${Z_DAYS} days): ${OUT.filter(o => r.z[o.k]).map(o => `<b${Math.abs(r.z[o.k].z) > Z_CUT ? ' style="color:var(--warn)"' : ''}>${TNAME[o.k]} ${zTxt(r.z[o.k].z)}</b> (usual ${r.z[o.k].m.toFixed(1)} %, ${r.z[o.k].n} results)`).join(' · ')}. Above ${Z_CUT} either way = unusual, a possible error.`
+      : `No Z score: fewer than ${Z_MIN} results ${r.supplier ? 'for ' + esc(r.supplier) + ' ' : '(no supplier in the sheet) '}within ${Z_DAYS} days, so only the fixed limits check it.`}</p>` : ''}
     <div class="scroll"><table><thead><tr><th>Test</th><th>W1 empty (g)</th><th>W2 + sample (g)</th><th>W3 after heating (g)</th><th>Sample (g)</th><th>${'Loss / residue %'}</th></tr></thead>
       <tbody>${tests.map(k => { const w = r.w[k] || [], m = massOf(w), p = pctOf(k);
         return `<tr><td>${TNAME[k]}</td>${[0, 1, 2].map(i => `<td>${isNum(w[i]) ? w[i].toFixed(4) : '–'}${st(k, 'W' + (i + 1))}</td>`).join('')}
@@ -1365,9 +1383,9 @@ async function saveWeights(code, tests, snap, nw, via, isNew) {
 
 function csv(list) {
   const head = ['App', 'Code', 'Sample name', 'Supplier', 'Sample date', 'Machine', 'Status', 'Waiting for', 'Moisture % (ar)', 'Total moisture %',
-    'VM loss %', 'VM % (ar)', 'VM % (db)', 'Ash % (ar)', 'Ash % (db)', 'FC % (ar)', 'FC % (db)', 'Flags', 'Possible errors', 'Retest', 'Approved by', 'Approved at', 'Last weighed', 'Weighed by'];
+    'VM loss %', 'VM % (ar)', 'VM % (db)', 'Ash % (ar)', 'Ash % (db)', 'FC % (ar)', 'FC % (db)', 'Z Moisture', 'Z VM (db)', 'Z Ash (db)', 'Flags', 'Possible errors', 'Retest', 'Approved by', 'Approved at', 'Last weighed', 'Weighed by'];
   const rows = list.map(r => [SRC[r.src].label, r.code, r.name, r.supplier, r.date, r.machine, stLabel(r).replace(/^\S+ /, ''), r.pending.map(k => TNAME[k]).join(' '),
-    r.mc, r.tm, r.vml, r.vmAr, r.vmDb, r.ashAr, r.ashDb, r.fcAr, r.fcDb, r.flags.join('; '), r.checks.join('; '), [...new Set([...(r.state === 'flag' ? r.flagTests : []), ...r.suspect])].map(k => TNAME[k]).join(' '),
+    r.mc, r.tm, r.vml, r.vmAr, r.vmDb, r.ashAr, r.ashDb, r.fcAr, r.fcDb, ...OUT.map(o => r.z[o.k] ? r2(r.z[o.k].z) : ''), r.flags.join('; '), r.checks.join('; '), [...new Set([...(r.state === 'flag' ? r.flagTests : []), ...r.suspect])].map(k => TNAME[k]).join(' '),
     r.appr ? r.appr.by : '', r.appr ? r.appr.at : '', r.last ? new Date(r.last).toLocaleString('en-GB') : '', r.who.join(' ')]);
   const q = v => { const s = v == null ? '' : String(v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
   const blob = new Blob(['﻿' + [head, ...rows].map(x => x.map(q).join(',')).join('\r\n')], { type: 'text/csv' });
