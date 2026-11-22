@@ -12,6 +12,10 @@
              one VM card (18) per balance per batch (card "ASH W1-3" = Ash, balance W1, card serial 3; spot "ASH W1-3-5").
              Since lab-v56 batches are numbered per day (cards[tray].dn: 1, 2, 3 … every day), and the card and the
              phones show that number ("#1"); the serial in the QR stays unique and never changes.
+             Since lab-v63 (Today's batches): cards are made for the whole lab, not for a balance: "ASH B261123-3" =
+             Ash card of 23 Nov 2026 batch 3 (spot "ASH B261123-3-5"). Its bal is 0 until a worker opens its Ash or
+             VM card (or weighs Moisture of one of its samples): job cardClaim then gives all cards of that batch
+             (same bid) to that balance. The Name Tags Machine column no longer limits who weighs a sample.
    Ovens and furnaces: the workers do nothing there in the app. The supervisor puts a card / dishes in a free
              oven or furnace in the timer app (timer.html) and taps Taken out. The phone shows that status, and rings on that load's balance when time is up.
    Boards "ASH 2A-5" (balance 2, board A, spot 5) and old paper templates ("ASH A-5") still work for samples
@@ -21,6 +25,7 @@
               samples[code].ev = the trail: every weight, fix, undo, reset, pairing and red-screen warning.
               runs[rid] = { rid, place, test, tray, items: [{ h, code, w2 }], start, mins, bal, by, outAt, outBy, early, cancelled }.
               cards[tray] = { test, bal, batch (serial), day ("2026-11-03"), dn (batch of that day), codes: [code on spot 1, spot 2 …], at, by }   (job cards, labels page)
+                            Today's batches cards also have bid ("B261123-3"), kind (new / rest / retest), claimAt, claimBy; bal 0 = nobody started it yet
               settings = { mins: { MC, VM, ASH }, sounds: { MC, VM, ASH } (alarm sound keys, lib/sounds.js), soundFiles: [{ key, name, path }] (uploaded music), workers: [{ name, sym }] }   (set by the supervisor)
    Loaded before the main script: only declarations here, nothing that runs at load time. */
 
@@ -113,13 +118,18 @@ const minsFor = k => { const m = settings().mins; return (m && +m[k] > 0) ? +m[k
 const balNo = () => { const m = /^W([1-4])$/.exec(S.machine || ''); return m ? +m[1] : 0; };
 // Supervisor mode: needs the PIN (its hash is in data.json settings.pin) and switches itself off after 30 minutes
 const SUPER_MS = 30 * 60000;
-// Weighing machine of a sample (Name Tags sheet → names.json machine W1–W4): only that balance may weigh it.
-// Blank or ALL = any balance.
-const balsOf = code => { const n = nameOf(code); return [...new Set(String((n && n.machine) || '').toUpperCase().match(/W[1-4]/g) || [])].map(x => +x[1]); };
-function machineOk(code) {
-  const m = balsOf(code);
-  if (!m.length || m.includes(balNo()) || superOn()) return true;   // the supervisor may open any sample
-  S.code = code; redScreen(B().bad.otherMachine, { icon: ICON.balance, num: m.join(' / '), sub: code });
+// Since lab-v63 (Today's batches, Girish 2026-11-22) any balance may weigh any sample: the Name Tags Machine
+// column no longer limits it. Job cards still do (a card belongs to the balance that started it).
+function machineOk(code) { return true; }
+// Moisture of a sample on a Today's batches card: only on the balance of that batch. Nobody started the batch
+// yet: this balance takes it (all its cards). Returns false after showing the red screen.
+function mcBatchOk(code) {
+  let best = null; const c = cards();
+  Object.keys(c).forEach(tr => { const j = c[tr]; if (j.test === 'MC' && j.bid && (j.codes || []).includes(code) && (!best || (j.at || 0) > best.at)) best = j; });
+  if (!best || superOn()) return true;
+  if (!best.bal) { claimBatch(best.bid); return true; }
+  if (+best.bal === balNo()) return true;
+  S.code = code; redScreen(B().bad.otherCard, { icon: ICON.balance, num: String(best.bal), sub: code });
   return false;
 }
 const superOn = () => store.get('super') === '1' && Date.now() - (+store.get('superAt') || 0) < SUPER_MS;
@@ -204,6 +214,13 @@ function holderFromText(txt) {
     const dn = cardDayNo(tray);      // the day's batch number printed big on the card (older cards: the serial)
     return { id: pos ? `${tray}-${pos}` : null, test: m[1], bal, letter: '#' + (dn || batch), batch, dn, pos: pos || undefined, tray, card: true };
   }
+  // Today's batches card "ASH B261123-3" (Ash, 23 Nov 2026, batch 3: no balance until a worker starts it) and its spot "ASH B261123-3-5"
+  m = up.match(/^(ASH|VM)\s*B(\d{6})\s*[-_ ]\s*0*(\d{1,3})(?:\s*[-_ ]\s*0*(\d{1,2}))?$/);
+  if (m) {
+    const bid = `B${m[2]}-${+m[3]}`, tray = `${m[1]} ${bid}`, pos = m[4] ? +m[4] : 0;
+    if (pos > CAP[m[1]]) return null;
+    return { id: pos ? `${tray}-${pos}` : null, test: m[1], bal: cardBal(tray), letter: '#' + (+m[3]), batch: +m[3], dn: +m[3], bid, pos: pos || undefined, tray, card: true };
+  }
   m = up.match(/^(ASH|VM)\s*[-_ ]?\s*([1-4]?)\s*([A-Z])\s*[-_ ]?\s*0*(\d{1,2})$/);
   if (m && +m[4] >= 1 && +m[4] <= CAP[m[1]]) {
     const bal = m[2] ? +m[2] : 0, tray = `${m[1]} ${bal || ''}${m[3]}`;
@@ -215,12 +232,14 @@ function holderFromText(txt) {
 }
 // Batch number of the day of a saved job card (0 for cards printed before lab-v56), and its day
 function cardDayNo(tray) { try { const j = S.data && S.data.cards && S.data.cards[tray]; return (j && +j.dn) || 0; } catch (e) { return 0; } }
+function cardBal(tray) { try { const j = S.data && S.data.cards && S.data.cards[tray]; return (j && +j.bal) || 0; } catch (e) { return 0; } }
 function cardDayOf(tray) { try { const j = S.data && S.data.cards && S.data.cards[tray]; return (j && j.dn && j.day) || ''; } catch (e) { return ''; } }
 const hInfo = id => holderFromText(id) || { id, test: 'MC', n: id };
 // a card carried over from an earlier day also shows its day ("Ash W1 #1 · 2 Nov"), as today's #1 can be on the bench too
 const dayTag = tr => { const d = cardDayOf(tr), now = new Date(), t = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
   return d && d !== t ? ' · ' + new Date(d + 'T12:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }) : ''; };
-const trayName = tr => { const i = hInfo(tr); return i.card ? B().boardName(i.test, 'W' + i.bal, ' ' + i.letter) + dayTag(tr) : B().boardName(i.test, i.bal, i.letter); };
+const trayName = tr => { const i = hInfo(tr); return i.bid ? B().boardName(i.test, '', i.letter) + dayTag(tr)
+  : i.card ? B().boardName(i.test, 'W' + i.bal, ' ' + i.letter) + dayTag(tr) : B().boardName(i.test, i.bal, i.letter); };
 const hName = id => { const i = hInfo(id); return i.test === 'MC' ? `${B().dish} ${i.n}` : `${trayName(i.tray)} · ${i.pos}`; };
 const hBig = id => { const i = hInfo(id); return String(i.test === 'MC' ? i.n : i.pos); };
 
@@ -267,6 +286,10 @@ function batchApply(f, j) {
       f.cardsDeleted[j.tray] = Object.assign({}, c, { delAt: j.at, delBy: j.worker || '' });
       delete f.cards[j.tray];
     }
+    return true;
+  }
+  if (j.action === 'cardClaim') {                     // Today's batches: the first balance to start a batch gets all its cards
+    Object.values(f.cards || {}).forEach(c => { if (c.bid === j.bid && !+c.bal) { c.bal = j.bal; c.claimAt = j.at; c.claimBy = j.worker || ''; } });
     return true;
   }
   if (j.action === 'setPin') { f.settings = f.settings || {}; f.settings.pin = j.pin; return true; }
@@ -474,9 +497,12 @@ function openCard(tray) {
   const t = B(), j = cards()[tray], k = hInfo(tray).test;
   if (!j) { redScreen(t.bad.notCard, { icon: ICON[k] }); return; }
   if (!balNo()) { redScreen(t.bad.noBal, { icon: ICON.balance, toBal: true }); return; }
+  if (j.bid && !+j.bal) { claimBatch(j.bid); good(); toast(`#${j.dn} → ${B().bal} ${balNo()}`, true); S.card = tray; S.view = 'card'; render(); return; }
   if (+j.bal !== balNo()) { redScreen(t.bad.otherCard, { icon: ICON.balance, num: String(j.bal) }); return; }
   good(); S.card = tray; S.view = 'card'; render();
 }
+// Today's batches: this balance starts batch bid (all its cards: Moisture, Ash and VM)
+function claimBatch(bid) { if (bid && balNo()) enqueue({ action: 'cardClaim', bid, bal: balNo(), worker: S.worker }); }
 function cardNext() {
   const tray = S.walk && S.walk.card, j = tray && cards()[tray];
   if (!j) { S.walk = null; S.view = 'home'; render(); return; }
@@ -896,6 +922,7 @@ function openTestB(k) {
   const t = B(), s = sample(S.code), st = s.tests[k], c0 = HELD.includes(k) && cardSpot(S.code, k);
   // a code on this balance's job card is allotted to it, whatever the sheet's Machine column says now
   if (!(c0 && c0.bal === balNo()) && !machineOk(S.code)) return;
+  if (k === 'MC' && st.done < 3 && !mcBatchOk(S.code)) return;
   if (HELD.includes(k) && S.via !== S.code + '|' + k) {
     // not from a scan: what tapping the tile does
     if (st.done === 0 && k === 'MC') { openScanner('dish'); return; }
@@ -903,6 +930,7 @@ function openTestB(k) {
       if (!balNo()) { redScreen(t.bad.noBal, { icon: ICON.balance, toBal: true }); return; }
       const c = cardSpot(S.code, k);
       if (!c) { redScreen(t.bad.noCard, { icon: ICON[k] }); return; }
+      if (!c.bal) { redScreen(t.bad.noCard, { icon: ICON.card }); return; }      // a new batch starts by scanning its card
       if (c.bal !== balNo()) { redScreen(t.bad.otherCard, { icon: ICON.balance, num: String(c.bal) }); return; }
       enqueue({ action: 'hold', code: S.code, key: k, holder: c.id, bal: balNo(), worker: S.worker });
       good();
