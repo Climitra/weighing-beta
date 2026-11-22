@@ -127,7 +127,14 @@
       <div class="opts">
         <div><label for="jbal">Weighing machine</label><select id="jbal"><option value="1">W1</option><option value="2">W2</option><option value="3">W3</option><option value="4">W4</option></select></div>
         <div><label for="jbatch">Today's batch</label><input type="text" id="jbatch" placeholder="next"></div>
+        <div><label for="jkind">Samples to fetch</label><select id="jkind">
+          <option value="all">All the sheet gives this machine</option>
+          <option value="new">New samples</option>
+          <option value="rest">Rest (remaining tests)</option>
+          <option value="retest">Retest</option>
+        </select></div>
       </div>
+      <p class="sub" style="margin:-4px 0 10px">New = none of its tests finished yet. Rest = part done (e.g. Moisture and VM weighed, Ash left). Retest = a test reset on the results page. Rest and Retest also take samples the sheet left without a machine (Rest: only ones weighed on this machine before).</p>
       <div class="opts">
         <div><label for="jmc">Moisture card codes (max 12)</label><input type="text" id="jmc" placeholder="T740, T741 …"></div>
         <div><label for="jash">Ash card codes (spot 1, 2 …, max 10)</label><input type="text" id="jash" placeholder="T740, T741 …"></div>
@@ -227,7 +234,8 @@ document.getElementById('tagprint').addEventListener('click', () => { if (makeTa
 
 /* ---------- job cards: data.json cards["ASH W1-3"] = { test, bal, batch, codes, at, by }, read by the weighing phones ---------- */
 const GH = { owner: 'girish-vastrakar', repo: 'weighing_data_QR', path: 'data.json', names: 'names.json', branch: 'main' };
-const store = { get: k => { try { return localStorage.getItem('lab:' + k) || ''; } catch (e) { return ''; } } };
+const store = { get: k => { try { return localStorage.getItem('lab:' + k) || ''; } catch (e) { return ''; } },
+  set: (k, v) => { try { localStorage.setItem('lab:' + k, v); } catch (e) { /* private window: not remembered */ } } };
 const b64 = str => btoa(unescape(encodeURIComponent(str)));
 const unb64 = str => decodeURIComponent(escape(atob(str.replace(/\n/g, ''))));
 const jmsg = t => { document.getElementById('jobmsg').textContent = t; };
@@ -306,40 +314,75 @@ let FILLED = {};
 // names[c].tests (sheet Tests column, e.g. "VM") limits a code to those tests; blank = all three.
 // names[c].batch (sheet Batch column, set by "Assign today's jobs"): when given, only that batch's codes.
 const wantsTest = (n, k) => !n.tests || String(n.tests).toUpperCase().split(/[^A-Z]+/).map(t => t === 'MOISTURE' || t === 'MT' ? 'MC' : t).includes(k);
-function allotted(f, names, bal, k, batch) {
+// "Samples to fetch" menu. Kind of a sample, the same way the sheet's Job type sees it (JobAssigner.gs):
+// retest = a test reset on the results page and not weighed again; rest = part done (one of its tests has W3); new = none finished yet
+const KINDS = { all: 'All', new: 'New samples', rest: 'Rest', retest: 'Retest' };
+const machinesOf = n => String((n && n.machine) || '').toUpperCase().match(/W[1-4]/g) || [];
+function kindOf(f, names, c) {
+  const s = f.samples && f.samples[c], done = k => { const w = s && s.w && s.w[k]; return !!w && w[2] != null; };
+  const ks = ['MC', 'ASH', 'VM'].filter(k => wantsTest(names[c] || {}, k));
+  if (((s && s.ev) || []).some(e => e.a === 'reset' && e.k && !done(e.k))) return 'retest';
+  return ks.some(done) ? 'rest' : 'new';
+}
+// Balances a sample was weighed on (dish / spot pairing, job cards): a part-done sample stays on its balance
+function weighedOn(f, c) {
+  const s = f.samples && f.samples[c], b = new Set(Object.values((s && s.hb) || {}).map(Number).filter(Boolean));
+  Object.values(f.cards || {}).forEach(j => { if ((j.codes || []).includes(c)) b.add(+j.bal); });
+  return b;
+}
+// Is this code for this balance? All / New: only the sheet's Machine column (as before).
+// Rest / Retest: also codes the sheet left without a machine (Rest: only if weighed on this balance before, or nowhere yet).
+function forBal(f, names, c, bal, kind) {
+  const ms = machinesOf(names[c]);
+  if (ms.includes('W' + bal)) return true;
+  if (ms.length || (kind !== 'rest' && kind !== 'retest')) return false;
+  if (kind === 'retest') return true;
+  const on = weighedOn(f, c); return !on.size || on.has(bal);
+}
+function allotted(f, names, bal, k, batch, kind = 'all') {
   // a card from before a results-page reset of that test no longer counts: the code must go on a new card
   const resetAt = c => Math.max(0, ...((f.samples && f.samples[c] && f.samples[c].ev) || []).filter(e => e.a === 'reset' && e.k === k).map(e => +e.t || 0));
   const on = new Set(Object.values(f.cards || {}).filter(j => j.test === k).flatMap(j => j.codes.filter(c => c && (+j.at || 0) > resetAt(c))));
   const started = c => { const s = f.samples && f.samples[c], w = s && s.w && s.w[k]; return !!w && w[0] != null; };
   const here = new Set(f.codes || []), floor = Math.max(0, ...(f.codes || []).filter(started).map(codeNum));
-  return Object.keys(names).filter(c => String(names[c].machine || '').toUpperCase().split(/[^A-Z0-9]+/).includes('W' + bal))
+  return Object.keys(names).filter(c => forBal(f, names, c, bal, kind))
+    .filter(c => kind === 'all' || kindOf(f, names, c) === kind)
     .filter(c => batch == null || +names[c].batch === batch)
     .filter(c => wantsTest(names[c], k) && !on.has(c) && !started(c) && (here.has(c) || codeNum(c) > floor))
     .sort((a, b) => codeNum(a) - codeNum(b));
 }
 // Lowest sheet batch of this balance that still has codes to put on a card (null = sheet has no batches: old way)
-function sheetBatch(f, names, bal) {
+function sheetBatch(f, names, bal, kind = 'all') {
+  // Rest and retest samples are single leftovers: they do not follow the sheet's Fixed 10 batch numbers
+  if (kind === 'rest' || kind === 'retest') return null;
   const nums = [...new Set(Object.keys(names).filter(c => +names[c].batch > 0 && String(names[c].machine || '').toUpperCase().split(/[^A-Z0-9]+/).includes('W' + bal)).map(c => +names[c].batch))].sort((a, b) => a - b);
-  return nums.find(n => ['MC', 'ASH', 'VM'].some(k => allotted(f, names, bal, k, n).length)) ?? null;
+  return nums.find(n => ['MC', 'ASH', 'VM'].some(k => allotted(f, names, bal, k, n, kind).length)) ?? null;
 }
 async function fillNext() {
-  const bal = +document.getElementById('jbal').value; jmsg('Reading the Google Sheet allotment…');
+  const bal = +document.getElementById('jbal').value, kind = document.getElementById('jkind').value || 'all';
+  jmsg('Reading the Google Sheet allotment…');
   try {
     const [{ f }, { f: n }] = await Promise.all([readJSON(GH.path), readJSON(GH.names)]);
     const names = n.names || {};
     // Sheet batch (same samples on all three cards) when the sheet assigned one; its number unless already used
-    const sb = sheetBatch(f, names, bal), used = sb != null && allCards(f).some(j => +j.bal === bal && +j.batch === sb);
+    const sb = sheetBatch(f, names, bal, kind), used = sb != null && allCards(f).some(j => +j.bal === bal && +j.batch === sb);
     FILLED[bal] = sb != null && !used ? sb : null;
     const num = nextDayNo(f, bal, todayKey());
     document.getElementById('jbatch').value = num;
-    document.getElementById('jmc').value = allotted(f, names, bal, 'MC', sb).slice(0, CAP.MC).join(', ');
-    document.getElementById('jash').value = allotted(f, names, bal, 'ASH', sb).slice(0, CAP.ASH).join(', ');
-    document.getElementById('jvm').value = allotted(f, names, bal, 'VM', sb).slice(0, CAP.VM).join(', ');
+    document.getElementById('jmc').value = allotted(f, names, bal, 'MC', sb, kind).slice(0, CAP.MC).join(', ');
+    document.getElementById('jash').value = allotted(f, names, bal, 'ASH', sb, kind).slice(0, CAP.ASH).join(', ');
+    document.getElementById('jvm').value = allotted(f, names, bal, 'VM', sb, kind).slice(0, CAP.VM).join(', ');
     const got = ['jmc', 'jash', 'jvm'].some(id => document.getElementById(id).value);
+    // how many codes of each kind wait for this balance, so the menu choice is easy
+    const waiting = kd => new Set(['MC', 'ASH', 'VM'].flatMap(k => allotted(f, names, bal, k, kd === 'all' || kd === 'new' ? sb : null, kd))).size;
+    const counts = ['new', 'rest', 'retest'].map(kd => `${KINDS[kd]} ${waiting(kd)}`).join(' · ');
+    const what = kind === 'all' ? '' : ` (${KINDS[kind]})`;
     // nothing new: say why, so it does not look broken
     const inSheet = Object.keys(names).filter(c => String(names[c].machine || '').toUpperCase().split(/[^A-Z0-9]+/).includes('W' + bal)).length;
-    jmsg(got ? `W${bal} · ${dayName(todayKey())} · batch ${num}${sb != null ? ' (sheet batch ' + sb + ')' : ''}: check the codes, then Save and print.`
-      : `No new codes for W${bal} in the Google Sheet: its ${inSheet} W${bal} codes are all on a saved card or weighed already (here or in the old app). Put new codes on W${bal} in the sheet (Machine column), wait for the sheet to sync, then Fill again. To print an old card again, use Reprint below.`);
+    jmsg((got ? `W${bal} · ${dayName(todayKey())} · batch ${num}${what}${sb != null ? ' (sheet batch ' + sb + ')' : ''}: check the codes, then Save and print.`
+      : kind !== 'all' ? `No ${{ new: 'new', rest: 'rest', retest: 'retest' }[kind]} codes waiting for W${bal}. Pick another kind in "Samples to fetch".`
+      : `No new codes for W${bal} in the Google Sheet: its ${inSheet} W${bal} codes are all on a saved card or weighed already (here or in the old app). Put new codes on W${bal} in the sheet (Machine column), wait for the sheet to sync, then Fill again. To print an old card again, use Reprint below.`)
+      + ` Waiting for W${bal}: ${counts}.`);
   } catch (e) { jmsg('⚠ ' + (e.message === 'Failed to fetch' ? 'No internet.' : e.message) + ' Open the weighing app setup link on this computer once so it has the lab key.'); }
 }
 // The card: big balance and batch, one QR for the whole card, the sample code in every circle
@@ -519,6 +562,10 @@ async function deleteCards(trays, b) {
 document.getElementById('jbal').addEventListener('change', listOld);
 listOld();
 document.getElementById('jnext').addEventListener('click', fillNext);
+// Samples to fetch: remembered on this computer; changing it fills the codes again
+const jkind = document.getElementById('jkind');
+if (KINDS[store.get('jkind')]) jkind.value = store.get('jkind');
+jkind.addEventListener('change', () => { store.set('jkind', jkind.value); fillNext(); });
 document.getElementById('jprint').addEventListener('click', printJobs);
 window.addEventListener('afterprint', () => document.body.classList.remove('onlyjobs', 'nojobs', 'onlytags'));
 </script>
