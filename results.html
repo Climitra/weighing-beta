@@ -198,12 +198,15 @@
 <script src="lib/retest.js"></script>
 <script>
 /* Supervisor results page. Reads the lab data straight from girish-vastrakar/weighing_data_QR
-   (public, so no key is needed), plus the old app's girish-vastrakar/weighing-data (private: only with a key
-   that can open it), and works the results out live, with the same formulas and
+   (public, so no key is needed), plus a copy of the old app's data in its old-app/ folder (copied from the
+   private weighing-data on 24 Nov 2026, so no extra key is needed), and works the results out live, with the same formulas and
    limits as scripts/compute_results.py and the weighing app: the supervisor's data.json settings.limits, else DEF_LIMITS
    (keep DEF_LIMITS in step with index.html and compute_results.py). */
 const GH = { owner: 'girish-vastrakar', branch: 'main' };
-const SRC = { qr: { repo: 'weighing_data_QR', label: 'QR app', open: true }, old: { repo: 'weighing-data', label: 'Old app' } };
+const SRC = { qr: { repo: 'weighing_data_QR', dir: '', label: 'QR app', open: true },
+              old: { repo: 'weighing_data_QR', dir: 'old-app/', label: 'Old app', open: true } };
+// old-app photos sit in one folder: old-app/photos/<file name>
+const photoPath = (src, p) => src === 'old' ? SRC.old.dir + 'photos/' + p.split('/').pop() : SRC[src].dir + p;
 // [lower, upper] %: moisture as received, VM / Ash / FC on dry basis; null = no limit
 const DEF_LIMITS = { MC: [1.5, 17.5], VM: [5, 17.5], ASH: [1.5, 12], FC: [null, null], TM: [1.5, 60] };
 const LIM_DB = { VM: true, ASH: true, FC: true };
@@ -216,12 +219,9 @@ const TSKEY = { MC: 'Moisture', VM: 'VM', ASH: 'Ash', TM: 'Total Moisture' };  /
 const store = { get: k => { try { return localStorage.getItem('lab:' + k) || ''; } catch (e) { return ''; } },
                 set: (k, v) => { try { localStorage.setItem('lab:' + k, v); } catch (e) {} } };
 let KEY = store.get('ghkey');  // used when this device already has the app's key (fresher reads); otherwise public reads
-// key for the old app's private repo: its own (set here or by a #oldkey= link), else the app's key
-let OLDKEY = store.get('oldkey') || KEY;
-(function keyFromLink() {
-  const m = location.hash.match(/oldkey=([^&]+)/);
-  if (m) { OLDKEY = decodeURIComponent(m[1]).trim(); store.set('oldkey', OLDKEY); history.replaceState(null, '', location.pathname); }
-})();
+// the old app's data now sits in weighing_data_QR/old-app, so the app's key covers it (the old separate key is not needed)
+let OLDKEY = KEY;
+try { localStorage.removeItem('lab:oldkey'); } catch (e) {}
 
 const V = { range: store.get('res-range') || '7d', status: 'all', machine: '', supplier: '', src: '', q: '', lim: '',
             basis: store.get('res-basis') || 'db', sort: 'done', dir: -1, cgroup: store.get('res-cgroup') || 'supplier', cdist: store.get('res-cdist') || 'sup', chide: new Set() };
@@ -234,7 +234,7 @@ async function fetchFile(src, path) {
   const open = SRC[src].open, key = open ? KEY : OLDKEY;
   let res;
   if (key) {
-    const url = `https://api.github.com/repos/${GH.owner}/${SRC[src].repo}/contents/${path}?ref=${GH.branch}`, c = ETAG[url];
+    const url = `https://api.github.com/repos/${GH.owner}/${SRC[src].repo}/contents/${SRC[src].dir}${path}?ref=${GH.branch}`, c = ETAG[url];
     res = await fetch(url, { cache: 'no-store', headers: { Authorization: 'Bearer ' + key, Accept: 'application/vnd.github.raw+json',
       ...(c ? { 'If-None-Match': c.etag } : {}) } }).catch(() => null);
     if (res && res.status === 304 && c) return c.json;
@@ -247,7 +247,7 @@ async function fetchFile(src, path) {
     if (res && res.status === 404) return null;
   }
   if (!open) throw new Error('no key');
-  res = await fetch(`https://raw.githubusercontent.com/${GH.owner}/${SRC[src].repo}/${GH.branch}/${path}?t=${Date.now()}`, { cache: 'no-store' });
+  res = await fetch(`https://raw.githubusercontent.com/${GH.owner}/${SRC[src].repo}/${GH.branch}/${SRC[src].dir}${path}?t=${Date.now()}`, { cache: 'no-store' });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error('GitHub error ' + res.status);
   return res.json();
@@ -261,7 +261,7 @@ async function loadSrc(src) {
            runs: Object.values((d && d.runs) || {}), settings: (d && d.settings) || {} };
 }
 async function load() {
-  const [q, o] = await Promise.allSettled([loadSrc('qr'), OLDKEY ? loadSrc('old') : Promise.reject(new Error('no key'))]);
+  const [q, o] = await Promise.allSettled([loadSrc('qr'), loadSrc('old')]);
   if (q.status === 'fulfilled') { SD.qr = q.value; ERR = null; }
   else ERR = q.reason.message === 'Failed to fetch' ? 'No internet connection.' : q.reason.message;
   if (o.status === 'fulfilled') { SD.old = o.value; OLDERR = null; }
@@ -315,12 +315,12 @@ async function setApproval(r, approve) {
   if (!key) {
     key = (prompt('Approving saves to GitHub. Paste the lab GitHub key (the same one the phones use). It is saved on this device.') || '').trim();
     if (!key) return;
-    if (r.src === 'old') { OLDKEY = key; store.set('oldkey', key); } else { KEY = key; store.set('ghkey', key); if (!store.get('oldkey')) OLDKEY = key; }
+    KEY = OLDKEY = key; store.set('ghkey', key);
   }
   if (who) store.set('supervisor', who);
   dlg.querySelectorAll('.apprbox button').forEach(b => b.disabled = true);
   msg.textContent = 'Saving…';
-  const url = `https://api.github.com/repos/${GH.owner}/${SRC[r.src].repo}/contents/approvals.json`;
+  const url = `https://api.github.com/repos/${GH.owner}/${SRC[r.src].repo}/contents/${SRC[r.src].dir}approvals.json`;
   const H = { Authorization: 'Bearer ' + key, Accept: 'application/vnd.github+json' };
   try {
     for (let attempt = 0; ; attempt++) {
@@ -355,11 +355,7 @@ async function setApproval(r, approve) {
   }
 }
 
-function addOldKey() {
-  const k = (prompt('Paste a GitHub key that can read girish-vastrakar/weighing-data (Contents: Read). It is saved on this device only.') || '').trim();
-  if (!k) return;
-  OLDKEY = k; store.set('oldkey', k); load();
-}
+function addOldKey() { load(); }  // old app data needs no key now: just try loading it again
 
 /* ---------- results (port of compute_results.py) ---------- */
 const normCode = c => String(c || '').replace(/[\s-]/g, '').toUpperCase();
@@ -515,7 +511,7 @@ async function autoConfirm() {
       && ((r.flags.length && !r.appr) || (r.checks.length && !r.checksOk && (!r.appr || r.appr.auto))));
     if (!todo.length) continue;
     autoBusy = true;
-    const url = `https://api.github.com/repos/${GH.owner}/${SRC[src].repo}/contents/approvals.json`;
+    const url = `https://api.github.com/repos/${GH.owner}/${SRC[src].repo}/contents/${SRC[src].dir}approvals.json`;
     const H = { Authorization: 'Bearer ' + key, Accept: 'application/vnd.github+json' };
     const same = (a, b) => !!a && JSON.stringify(a) === JSON.stringify(b);
     try {
@@ -647,7 +643,7 @@ function render() {
     <header><h1>Lab results</h1>
       <span class="meta">${ERR ? '⚠ ' + esc(ERR) + ' · showing last data · ' : ''}Updated ${LOADED ? hm(LOADED) : '–'} · refreshes every minute
         <button class="btn" id="refresh" aria-label="Refresh now">↻</button><a href="./">Weighing app</a><a href="timer.html">Timer</a><a href="dashboard.html">Lab timeline</a><a href="labels.html">Boards and labels</a> <button class="btn" id="paper">✎ Type in paper weights</button><br>
-        ${SD.old ? `Old app data included (${Object.keys(SD.old.samples).length} samples)` : `Old app data not shown${OLDERR && OLDERR !== 'no key' ? ': ' + esc(OLDERR) : ''} · <button class="btn" id="oldkey">Add old app data</button>`}</span></header>
+        ${SD.old ? `Old app data included (${Object.keys(SD.old.samples).length} samples)` : `Old app data not shown${OLDERR && OLDERR !== 'no key' ? ': ' + esc(OLDERR) : ''} · <button class="btn" id="oldkey">Try again</button>`}</span></header>
     ${filtersHTML(machines, suppliers, true)}
     <div class="tiles">
       <div class="tile"><b>${list.length}</b><span>samples in view</span></div>
@@ -705,14 +701,13 @@ function evLine(e) {
   }
   return esc(e.a);
 }
-// The photo itself, tap for full size. weighing_data_QR is public, so its raw file opens without the key;
-// old-app photos (private weighing-data) are fetched with the key after the dialog opens (loadPhotos)
+// The photo itself, tap for full size. weighing_data_QR is public (old-app photos too), so the raw file opens without the key
 const NOPHOTO = '<span class="sub"> · not uploaded from the phone yet</span>';
 function photoImg(r, p) {
   if (!p.path) return '';
   const alt = `${esc(r.code)} ${esc(TNAME[p.test] || p.test)} photo`;
   if (!SRC[r.src].open) return `<a class="tphoto" data-src="${esc(r.src)}" data-path="${esc(p.path)}" target="_blank" rel="noopener"><img alt="${alt}"></a>`;
-  const url = `https://raw.githubusercontent.com/${GH.owner}/${SRC[r.src].repo}/${GH.branch}/${p.path.split('/').map(encodeURIComponent).join('/')}`;
+  const url = `https://raw.githubusercontent.com/${GH.owner}/${SRC[r.src].repo}/${GH.branch}/${photoPath(r.src, p.path).split('/').map(encodeURIComponent).join('/')}`;
   return `<a class="tphoto" href="${esc(url)}" target="_blank" rel="noopener"><img src="${esc(url)}" alt="${alt}" loading="lazy"
     onerror="this.parentNode.outerHTML=NOPHOTO"></a>`;
 }
